@@ -1,0 +1,14 @@
+{
+  "name": "mongo-lookup-pagination-benchmark",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Reproduces and fixes the $lookup-then-filter + $skip pagination anti-pattern on MongoDB",
+  "scripts": {
+    "seed": "node seed.js",
+    "bench": "node benchmark.js"
+  },
+  "dependencies": {
+    "mongodb": "^6.9.0"
+  }
+}

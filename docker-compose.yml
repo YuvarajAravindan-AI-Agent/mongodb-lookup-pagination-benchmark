@@ -1,0 +1,31 @@
+services:
+  mongo:
+    image: mongo:7
+    container_name: mongo-bench
+    restart: unless-stopped
+    ports:
+      - "27018:27017"          # 27018 to avoid clashing with any local mongo
+    command:
+      # The client runs ~30 GB on an M20 (4 GB RAM) — a working set roughly
+      # 7x larger than cache. What matters is that RATIO, not absolute size.
+      # We reproduce it as a scale model: ~1.8 GB of data against a 0.25 GB
+      # cache is the same ~7:1 pressure, so evictions and disk reads behave
+      # the same way without needing 30 GB of laptop disk.
+      #
+      # Set CACHE_GB=4 while seeding (fast), then 0.25 to benchmark.
+      - --wiredTigerCacheSizeGB
+      - "${CACHE_GB:-0.25}"
+      - --slowms
+      - "100"
+      - --profile
+      - "1"
+    volumes:
+      - mongo-bench-data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  mongo-bench-data:

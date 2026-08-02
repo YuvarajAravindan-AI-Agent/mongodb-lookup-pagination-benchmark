@@ -1,0 +1,236 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MongoDB Atlas M20 — pagination performance, live</title>
+<style>
+  :root {
+    --bg:#0d1117; --panel:#161b22; --line:#30363d; --ink:#e6edf3; --dim:#8b949e;
+    --bad:#f85149; --mid:#d29922; --good:#3fb950; --accent:#58a6ff;
+    --mono:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,monospace;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);
+    font:15px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif}
+  .wrap{max-width:1180px;margin:0 auto;padding:32px 20px 64px}
+  h1{font-size:26px;margin:0 0 6px;letter-spacing:-.02em}
+  .sub{color:var(--dim);margin:0 0 22px}
+  .facts{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:28px}
+  .fact{background:var(--panel);border:1px solid var(--line);border-radius:6px;
+    padding:6px 11px;font:12px var(--mono);color:var(--dim)}
+  .fact b{color:var(--ink);font-weight:600}
+  .banner{background:#1c2128;border-left:3px solid var(--accent);border-radius:0 6px 6px 0;
+    padding:13px 16px;margin-bottom:28px;font-size:13.5px;color:var(--dim)}
+  .banner b{color:var(--ink)}
+  h2{font-size:17px;margin:34px 0 6px;letter-spacing:-.01em}
+  .hint{color:var(--dim);font-size:13.5px;margin:0 0 16px}
+  .ctl{display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin-bottom:18px}
+  label{font-size:13px;color:var(--dim)}
+  input[type=number],input[type=text]{background:#0d1117;border:1px solid var(--line);
+    color:var(--ink);border-radius:6px;padding:7px 10px;font:13px var(--mono);width:130px}
+  button{background:#21262d;border:1px solid var(--line);color:var(--ink);border-radius:6px;
+    padding:8px 15px;font-size:13.5px;font-weight:500;cursor:pointer}
+  button:hover:not(:disabled){background:#30363d;border-color:#8b949e}
+  button:disabled{opacity:.5;cursor:not-allowed}
+  button.primary{background:#238636;border-color:#2ea043}
+  button.primary:hover:not(:disabled){background:#2ea043}
+  .quick{display:flex;gap:6px}
+  .quick button{padding:6px 11px;font:12px var(--mono)}
+  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:14px}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:17px;
+    display:flex;flex-direction:column;min-height:230px}
+  .card.bad{border-top:2px solid var(--bad)}
+  .card.mid{border-top:2px solid var(--mid)}
+  .card.good{border-top:2px solid var(--good)}
+  .card h3{margin:0 0 3px;font-size:14.5px}
+  .card .tag{font:11px var(--mono);color:var(--dim);margin-bottom:12px}
+  .metric{font:600 34px/1.1 var(--mono);margin:10px 0 2px}
+  .metric.bad{color:var(--bad)} .metric.mid{color:var(--mid)} .metric.good{color:var(--good)}
+  .metric .u{font-size:15px;color:var(--dim);font-weight:400}
+  .stats{margin-top:auto;padding-top:12px;border-top:1px solid var(--line);
+    font:12px var(--mono);color:var(--dim)}
+  .stats div{display:flex;justify-content:space-between;padding:2px 0}
+  .stats b{color:var(--ink);font-weight:600}
+  .idle{color:var(--dim);font-size:13px;padding:22px 0}
+  .spin{display:inline-block;width:13px;height:13px;border:2px solid var(--line);
+    border-top-color:var(--accent);border-radius:50%;animation:s .7s linear infinite;
+    vertical-align:-2px;margin-right:7px}
+  @keyframes s{to{transform:rotate(360deg)}}
+  code{background:#0d1117;border:1px solid var(--line);border-radius:4px;padding:1px 5px;
+    font:12px var(--mono)}
+  .foot{margin-top:44px;padding-top:18px;border-top:1px solid var(--line);
+    color:var(--dim);font-size:12.5px}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <h1>Paginated <code>$lookup</code> on a memory-constrained cluster</h1>
+  <p class="sub">Run the three strategies yourself. Same data, same result set, same page — only the query shape differs.</p>
+
+  <div class="facts" id="facts"><span class="fact">loading…</span></div>
+
+  <div class="banner">
+    <b>This is an independent reproduction, not your cluster.</b> The dataset is synthetic, but the
+    constraint is modelled faithfully: your ~30&nbsp;GB on an M20's 4&nbsp;GB of RAM is roughly a
+    <b>7:1 data-to-cache ratio</b>, reproduced here as ~1.3&nbsp;GB against a 0.25&nbsp;GB WiredTiger cache.
+    Every query below is capped — a timeout <em>is</em> the result.
+  </div>
+
+  <h2>1 · The listing endpoint</h2>
+  <p class="hint">Set a page and run all three. Then try page 500 and watch which ones survive.</p>
+
+  <div class="ctl">
+    <label for="page">Page</label>
+    <input type="number" id="page" value="1" min="1" max="15000">
+    <span class="quick">
+      <button data-page="1">1</button>
+      <button data-page="50">50</button>
+      <button data-page="500">500</button>
+      <button data-page="5000">5000</button>
+    </span>
+    <button class="primary" id="runAll">Run all three</button>
+  </div>
+
+  <div class="grid">
+    <div class="card bad" id="cA">
+      <h3>A · Current implementation</h3>
+      <div class="tag">$lookup → $unwind → $match → $sort → $skip</div>
+      <div class="body"><div class="idle">not run yet</div></div>
+    </div>
+    <div class="card mid" id="cB">
+      <h3>B · Reverse the join</h3>
+      <div class="tag">customers first → $in → $skip</div>
+      <div class="body"><div class="idle">not run yet</div></div>
+    </div>
+    <div class="card good" id="cC">
+      <h3>C · Denormalised + ESR + keyset</h3>
+      <div class="tag">one compound index, range cursor</div>
+      <div class="body"><div class="idle">not run yet</div></div>
+    </div>
+  </div>
+
+  <h2>2 · The search box</h2>
+  <p class="hint">
+    An unanchored <code>/term/</code> cannot use an index. Search for something <em>rare</em> — the
+    scan must read every document before it can say "no results".
+  </p>
+
+  <div class="ctl">
+    <label for="term">Term</label>
+    <input type="text" id="term" value="zzqx7v">
+    <button id="runUn">Unanchored (no index)</button>
+    <button id="runAn">Anchored + index</button>
+  </div>
+
+  <div class="grid">
+    <div class="card bad" id="sU">
+      <h3>Unanchored <code>/term/</code></h3>
+      <div class="tag">COLLSCAN — every document read</div>
+      <div class="body"><div class="idle">not run yet</div></div>
+    </div>
+    <div class="card good" id="sA">
+      <h3>Anchored <code>/^term/</code> + index</h3>
+      <div class="tag">IXSCAN — b-tree range seek</div>
+      <div class="body"><div class="idle">not run yet</div></div>
+    </div>
+  </div>
+
+  <div class="foot">
+    <b>examined per returned</b> is the number that matters: documents the server read for every
+    document you received. When it runs to thousands, cache thrashes, CPU spikes, and a stalled
+    primary is what triggers a replica-set election. Fixing that is cheaper than a tier upgrade.
+  </div>
+</div>
+
+<script>
+const $ = (s) => document.querySelector(s);
+let MAXMS = 15000;
+
+fetch('/api/meta').then(r => r.json()).then(m => {
+  MAXMS = m.maxMs;
+  $('#facts').innerHTML = [
+    ['orders', m.orders.toLocaleString()],
+    ['customers', m.customers.toLocaleString()],
+    ['data', m.dataMB.toLocaleString() + ' MB'],
+    ['indexes', m.indexMB.toLocaleString() + ' MB'],
+    ['WiredTiger cache', m.cacheGB.toFixed(2) + ' GB'],
+    ['query cap', (m.maxMs / 1000) + ' s'],
+  ].map(([k, v]) => `<span class="fact">${k} <b>${v}</b></span>`).join('');
+}).catch(() => $('#facts').innerHTML = '<span class="fact">could not reach API</span>');
+
+const busy = (card, msg) => {
+  card.querySelector('.body').innerHTML = `<div class="idle"><span class="spin"></span>${msg}</div>`;
+};
+
+function render(card, d, tone) {
+  if (d.error) {
+    card.querySelector('.body').innerHTML = `<div class="idle" style="color:var(--bad)">${d.error}</div>`;
+    return;
+  }
+  if (d.timedOut) {
+    card.querySelector('.body').innerHTML = `
+      <div class="metric bad">TIMEOUT</div>
+      <div style="color:var(--dim);font-size:13px">exceeded the ${MAXMS / 1000}s ceiling — this query cannot serve a web request</div>
+      <div class="stats"><div><span>cap</span><b>${MAXMS / 1000}s</b></div></div>`;
+    return;
+  }
+  const ratio = d.nReturned ? Math.round(d.docsExamined / d.nReturned) : 0;
+  card.querySelector('.body').innerHTML = `
+    <div class="metric ${tone}">${d.ms.toLocaleString()}<span class="u"> ms</span></div>
+    <div style="color:var(--dim);font-size:13px">${d.nReturned} rows returned</div>
+    <div class="stats">
+      <div><span>docsExamined</span><b>${d.docsExamined.toLocaleString()}</b></div>
+      <div><span>keysExamined</span><b>${d.keysExamined.toLocaleString()}</b></div>
+      <div><span>examined per returned</span><b>${ratio.toLocaleString()}</b></div>
+    </div>`;
+}
+
+async function runStrategy(key, cardSel, tone) {
+  const card = $(cardSel);
+  const page = Number($('#page').value) || 1;
+  busy(card, key === 'A' ? `running… (may hit the ${MAXMS / 1000}s cap)` : 'running…');
+  try {
+    const r = await fetch('/api/run', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ strategy: key, page }),
+    });
+    render(card, await r.json(), tone);
+  } catch (e) {
+    render(card, { error: e.message }, tone);
+  }
+}
+
+$('#runAll').onclick = async () => {
+  const btn = $('#runAll');
+  btn.disabled = true; btn.textContent = 'running…';
+  // C and B first so the fast answers are on screen while A grinds.
+  await runStrategy('C', '#cC', 'good');
+  await runStrategy('B', '#cB', 'mid');
+  await runStrategy('A', '#cA', 'bad');
+  btn.disabled = false; btn.textContent = 'Run all three';
+};
+
+document.querySelectorAll('.quick button').forEach(b => {
+  b.onclick = () => { $('#page').value = b.dataset.page; $('#runAll').click(); };
+});
+
+async function runSearch(mode, cardSel, tone) {
+  const card = $(cardSel);
+  busy(card, 'running…');
+  try {
+    const r = await fetch('/api/search', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ mode, term: $('#term').value }),
+    });
+    render(card, await r.json(), tone);
+  } catch (e) {
+    render(card, { error: e.message }, tone);
+  }
+}
+$('#runUn').onclick = () => runSearch('unanchored', '#sU', 'bad');
+$('#runAn').onclick = () => runSearch('anchored', '#sA', 'good');
+</script>
+</body>
+</html>

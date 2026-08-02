@@ -1,0 +1,12 @@
+spring:
+  main:
+    web-application-type: none
+    banner-mode: off
+  data:
+    mongodb:
+      uri: ${MONGO_URI:mongodb://localhost:27018}
+      database: ${MONGO_DB:bench}
+logging:
+  level:
+    root: WARN
+    com.aiagentic: INFO
