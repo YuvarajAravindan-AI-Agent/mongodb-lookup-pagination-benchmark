@@ -82,6 +82,72 @@ const app = express();
 app.use(express.json());
 app.use(express.static(join(__dirname, "public")));
 
+/**
+ * Throttling — mandatory once this is publicly reachable.
+ *
+ * Strategy A saturates a core for the full 15s ceiling. Without a limit, a
+ * handful of concurrent visitors (or one bored person with a loop) trivially
+ * wedges the host. Two guards:
+ *
+ *   1. A global semaphore on expensive work — only N heavy queries in flight.
+ *   2. A per-IP cooldown, so one client cannot monopolise those slots.
+ *
+ * Rejections return 429 with a human explanation rather than queueing, because
+ * a visitor waiting 60s behind a queue will assume the demo is broken — which
+ * is the opposite of the point.
+ */
+const MAX_CONCURRENT = Number(process.env.MAX_CONCURRENT || 2);
+const BURST = Number(process.env.BURST || 4);           // "Run all three" needs 3
+const REFILL_MS = Number(process.env.REFILL_MS || 4000); // one token per 4s
+
+let inFlight = 0;
+const buckets = new Map(); // ip -> { tokens, last }
+
+setInterval(() => {
+  const cutoff = Date.now() - 300_000;
+  for (const [ip, b] of buckets) if (b.last < cutoff) buckets.delete(ip);
+}, 120_000).unref();
+
+/**
+ * Token bucket rather than a fixed cooldown.
+ *
+ * A hard cooldown looks correct in a curl test and then breaks the actual UI —
+ * "Run all three" fires three requests back to back and the second gets a 429.
+ * A bucket of BURST tokens refilling every REFILL_MS lets a legitimate run
+ * through while still throttling anyone looping the endpoint.
+ */
+function throttle(req, res, next) {
+  const ip = req.headers["x-forwarded-for"]?.split(",")[0].trim() || req.ip;
+  const now = Date.now();
+
+  const b = buckets.get(ip) ?? { tokens: BURST, last: now };
+  b.tokens = Math.min(BURST, b.tokens + Math.floor((now - b.last) / REFILL_MS));
+  b.last = now;
+
+  if (b.tokens <= 0) {
+    buckets.set(ip, b);
+    return res.status(429).json({
+      error: `Slow down — this demo runs on one small server. One more query in ~${REFILL_MS / 1000}s.`,
+    });
+  }
+  if (inFlight >= MAX_CONCURRENT) {
+    buckets.set(ip, b);
+    return res.status(429).json({
+      error: "Demo is busy running someone else's query. Try again in a few seconds.",
+    });
+  }
+
+  b.tokens--;
+  buckets.set(ip, b);
+
+  inFlight++;
+  let released = false;
+  const release = () => { if (!released) { released = true; inFlight--; } };
+  res.on("finish", release);
+  res.on("close", release);
+  next();
+}
+
 app.get("/api/meta", async (_req, res) => {
   const [o, c, stats] = await Promise.all([
     orders.estimatedDocumentCount(),
@@ -100,7 +166,7 @@ app.get("/api/meta", async (_req, res) => {
   });
 });
 
-app.post("/api/run", async (req, res) => {
+app.post("/api/run", throttle, async (req, res) => {
   const strategy = String(req.body.strategy || "C");
   const page = Math.max(1, Number(req.body.page || 1));
   const skip = (page - 1) * PAGE_SIZE;
@@ -129,7 +195,7 @@ app.post("/api/run", async (req, res) => {
   }
 });
 
-app.post("/api/search", async (req, res) => {
+app.post("/api/search", throttle, async (req, res) => {
   const mode = req.body.mode === "anchored" ? "anchored" : "unanchored";
   const term = String(req.body.term || "ORD000500000");
   const filter = mode === "anchored" ? regex.anchoredIndexed(term) : regex.unanchored(term);
